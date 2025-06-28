@@ -1,0 +1,228 @@
+#ADVERSARIAL ATTACKS
+
+class LocalSearchAttackGAF:
+    def __init__(self, model, max_episodes=150, reset_interval=10, perturbation_range=(0.8, 1.2)):
+        self.model = model
+        self.max_episodes = max_episodes
+        self.reset_interval = reset_interval
+        self.perturbation_range = perturbation_range
+        self.query_count = 0
+
+    def reconstruct_time_series_from_diagonal(self, diagonal_elements):
+        diagonal_clipped = np.clip(diagonal_elements, -1, 1)
+        phi = np.arccos(diagonal_clipped)
+        reconstructed_ts = np.cos(phi / 2)
+        return reconstructed_ts
+
+    def gramian_angular_field(self, ts):
+        min_ts = np.min(ts)
+        max_ts = np.max(ts)
+
+        if max_ts == min_ts:
+            scaled_ts = np.full_like(ts, 0.5)
+        else:
+            scaled_ts = (ts - min_ts) / (max_ts - min_ts)
+
+        scaled_ts = np.clip(scaled_ts, 0, 1)
+        phi = np.arccos(scaled_ts)
+        gaf = np.cos(phi[:, None] + phi[None, :])
+
+        return gaf
+
+    def reconstruct_full_gaf_from_modified_diagonal(self, original_gaf, modified_diagonal):
+        reconstructed_ts = self.reconstruct_time_series_from_diagonal(modified_diagonal)
+        new_gaf = self.gramian_angular_field(reconstructed_ts)
+        return new_gaf
+
+    def get_model_prediction(self, gaf_matrix):
+        if gaf_matrix.ndim == 2:
+            gaf_input = np.stack([gaf_matrix] * 4, axis=2)
+        else:
+            gaf_input = gaf_matrix
+
+        gaf_input = gaf_input.reshape(1, *gaf_input.shape)
+
+        prediction = self.model.predict(gaf_input, verbose=0)
+        self.query_count += 1
+
+        return prediction
+
+    def local_search_attack(self, original_gaf_stack, original_label):
+        print(f"Starting local search attack on pattern: {original_label}")
+        print(f"Original GAF shape: {original_gaf_stack.shape}")
+
+        original_gaf = original_gaf_stack[:, :, 0]
+        T = original_gaf.shape[0]
+
+        D = copy.deepcopy(original_gaf)
+
+        A = copy.deepcopy(original_gaf)
+        t = 0
+
+        original_pred = self.get_model_prediction(original_gaf_stack)
+        original_class = np.argmax(original_pred[0])
+
+        print(f"Original prediction: Class {original_class}, Confidence: {original_pred[0][original_class]:.4f}")
+
+        for episode in range(self.max_episodes):
+            print(f"Episode {episode + 1}/{self.max_episodes}, Counter: {t}")
+
+            if t == self.reset_interval:
+                print("Resetting matrix to original state")
+                A = copy.deepcopy(D)
+                t = 0
+
+            modified_diagonal = []
+
+            for l in range(T):
+                r_l = np.random.uniform(self.perturbation_range[0], self.perturbation_range[1])
+                perturbed_value = r_l * A[l, l]
+
+                if perturbed_value >= 0.5 or perturbed_value <= -0.5:
+                    modified_diagonal.append(A[l, l])
+                else:
+                    modified_diagonal.append(perturbed_value)
+                    A[l, l] = perturbed_value
+
+            t += 1
+
+            try:
+                A_prime = self.reconstruct_full_gaf_from_modified_diagonal(A, np.array(modified_diagonal))
+                A_prime_stack = np.stack([A_prime] * 4, axis=2)
+
+                adversarial_pred = self.get_model_prediction(A_prime_stack)
+                adversarial_class = np.argmax(adversarial_pred[0])
+
+                print(f"  Perturbed prediction: Class {adversarial_class}, Confidence: {adversarial_pred[0][adversarial_class]:.4f}")
+
+                if adversarial_class != original_class:
+                    print(f"SUCCESS! Attack succeeded in episode {episode + 1}")
+                    print(f"Original class: {original_class} -> Adversarial class: {adversarial_class}")
+                    print(f"Total queries used: {self.query_count}")
+                    return A_prime_stack, True, episode + 1
+
+            except Exception as e:
+                print(f"  Error in GAF reconstruction: {e}")
+                continue
+
+        print(f"Attack failed after {self.max_episodes} episodes")
+        print(f"Total queries used: {self.query_count}")
+        return None, False, self.max_episodes
+
+def run_adversarial_attack_experiment(classifier, X_test, y_test, num_samples=10):
+    print("\n" + "="*60)
+    print("ADVERSARIAL ATTACK EXPERIMENT")
+    print("="*60)
+
+    attack = LocalSearchAttackGAF(
+        model=classifier.model,
+        max_episodes=150,
+        reset_interval=10,
+        perturbation_range=(0.8, 1.2)
+    )
+
+    test_indices = np.random.choice(len(X_test), size=min(num_samples, len(X_test)), replace=False)
+
+    attack_results = {
+        'success_count': 0,
+        'total_attempts': 0,
+        'episodes_used': [],
+        'original_classes': [],
+        'adversarial_classes': [],
+        'query_counts': []
+    }
+
+    for i, idx in enumerate(test_indices):
+        print(f"\n--- Attack {i+1}/{len(test_indices)} ---")
+
+        original_gaf = X_test[idx]
+        original_label = np.argmax(y_test[idx])
+
+        attack.query_count = 0
+
+        adversarial_gaf, success, episodes = attack.local_search_attack(original_gaf, original_label)
+
+        attack_results['total_attempts'] += 1
+        attack_results['episodes_used'].append(episodes)
+        attack_results['original_classes'].append(original_label)
+        attack_results['query_counts'].append(attack.query_count)
+
+        if success:
+            attack_results['success_count'] += 1
+            adversarial_pred = attack.get_model_prediction(adversarial_gaf)
+            adversarial_class = np.argmax(adversarial_pred[0])
+            attack_results['adversarial_classes'].append(adversarial_class)
+        else:
+            attack_results['adversarial_classes'].append(original_label)
+
+    print("\n" + "="*60)
+    print("ATTACK RESULTS SUMMARY")
+    print("="*60)
+
+    success_rate = attack_results['success_count'] / attack_results['total_attempts'] * 100
+    avg_episodes = np.mean(attack_results['episodes_used'])
+    avg_queries = np.mean(attack_results['query_counts'])
+
+    print(f"Success Rate: {attack_results['success_count']}/{attack_results['total_attempts']} ({success_rate:.1f}%)")
+    print(f"Average Episodes: {avg_episodes:.1f}")
+    print(f"Average Queries: {avg_queries:.1f}")
+
+    print(f"\nPattern Transitions:")
+    for i in range(len(attack_results['original_classes'])):
+        orig = attack_results['original_classes'][i]
+        adv = attack_results['adversarial_classes'][i]
+        if orig != adv:
+            print(f"  {classifier.pattern_names[orig]} -> {classifier.pattern_names[adv]}")
+
+    return attack_results
+
+def main():
+    print("GAF-CNN CANDLESTICK PATTERN IDENTIFICATION WITH ADVERSARIAL ATTACK")
+    print("="*60)
+
+    print("\nLoading RELIANCE.csv...")
+    try:
+        df = pd.read_csv('RELIANCE.csv')
+        print(f"Loaded data with shape: {df.shape}")
+        print(f"Columns: {df.columns.tolist()}")
+        print(f"Date range: {df.index[0]} to {df.index[-1]}")
+
+        required_columns = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_columns):
+            raise ValueError(f"Required columns {required_columns} not found in data")
+
+        classifier = GAFCNNCandlestickClassifier(window_size=10)
+
+        print("\n" + "="*60)
+        print("STARTING TRAINING WITH REAL PATTERN RECOGNITION")
+        print("="*60)
+
+        history = classifier.train_and_evaluate(
+            df=df,
+            epochs=50,
+            batch_size=64,
+            test_size=0.2
+        )
+
+        culr_df = classifier.calculate_culr_features(df)
+        X = classifier.prepare_gaf_cnn_data(culr_df)
+        pattern_labels = classifier.identify_candlestick_patterns(df)
+        y = to_categorical(pattern_labels, num_classes=9)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=np.argmax(y, axis=1)
+        )
+
+        attack_results = run_adversarial_attack_experiment(
+            classifier, X_test, y_test, num_samples=5
+        )
+
+        classifier.plot_training_history(history)
+
+    except FileNotFoundError:
+        print("Error: RELIANCE.csv file not found.")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
